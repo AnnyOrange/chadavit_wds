@@ -25,7 +25,7 @@ import hydra
 import torch
 import wandb
 from torchsummary import summary
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, RichModelSummary
 from pytorch_lightning.loggers import WandbLogger
@@ -69,6 +69,21 @@ os.environ["WANDB__SERVICE_WAIT"] = "300"
 os.environ["_WANDB_STARTUP_DEBUG"] = "true"
 
 
+def _num_devices(cfg: DictConfig) -> int:
+    d = cfg.devices
+    if isinstance(d, (list, ListConfig)):
+        return len(d)
+    return int(d)
+
+
+ALBUMENTATIONS_DATASETS = {
+    "idrcell100k",
+    "idrcell100k_3channels",
+    "bray",
+    "wds_packed_shards",
+}
+
+
 @hydra.main(version_base="1.2")
 def main(cfg: DictConfig):
     # hydra doesn't allow us to add new keys for "safety"
@@ -99,8 +114,11 @@ def main(cfg: DictConfig):
     if cfg.ssl_val_loss:
         # pretrain dataloader
         pipelines = []
+        use_albumentations_pipeline = (
+            cfg.mixed_channels or cfg.data.dataset in ALBUMENTATIONS_DATASETS
+        )
         for aug_cfg in cfg.augmentations:
-            if cfg.mixed_channels:
+            if use_albumentations_pipeline:
                 pipelines.append(
                     NCropAlbumentationAugmentation(
                         build_transform_pipeline(cfg.data.dataset, aug_cfg),
@@ -131,6 +149,14 @@ def main(cfg: DictConfig):
             data_fraction=cfg.data.fraction,
             return_val_dataset=cfg.ssl_val_loss,
             sample_ratio=cfg.data.sample_ratio,
+            wds_train_pattern=cfg.data.wds_train_pattern,
+            wds_val_pattern=cfg.data.wds_val_pattern,
+            wds_channels=cfg.data.wds_channels,
+            wds_count_mode=cfg.data.wds_count_mode,
+            wds_estimate_n_shards=cfg.data.wds_estimate_n_shards,
+            wds_estimated_samples=cfg.data.wds_estimated_samples,
+            wds_min_channels=cfg.data.wds_min_channels,
+            wds_require_all_channels=cfg.data.wds_require_all_channels,
         )
 
         train_loader = prepare_dataloader(
@@ -152,22 +178,30 @@ def main(cfg: DictConfig):
 
     else:
         # validation dataloader for when it is available
-        val_data_format = cfg.data.format
-        _, val_loader = prepare_data_classification(
-            cfg.data.dataset,
-            train_data_path=cfg.data.train_path,
-            val_data_path=cfg.data.val_path,
-            data_format=val_data_format,
-            batch_size=cfg.optimizer.batch_size,
-            num_workers=cfg.data.num_workers,
-            channel_strategy=cfg.channels_strategy,
-            sample_ratio=cfg.data.sample_ratio,
-        )
+        # Some pretraining-only datasets (e.g. WDS shards) are not supported by
+        # classification_dataloader. In that case we skip classification val loader.
+        if cfg.data.dataset == "wds_packed_shards":
+            val_loader = None
+        else:
+            val_data_format = cfg.data.format
+            _, val_loader = prepare_data_classification(
+                cfg.data.dataset,
+                train_data_path=cfg.data.train_path,
+                val_data_path=cfg.data.val_path,
+                data_format=val_data_format,
+                batch_size=cfg.optimizer.batch_size,
+                num_workers=cfg.data.num_workers,
+                channel_strategy=cfg.channels_strategy,
+                sample_ratio=cfg.data.sample_ratio,
+            )
 
         # pretrain dataloader
         pipelines = []
+        use_albumentations_pipeline = (
+            cfg.mixed_channels or cfg.data.dataset in ALBUMENTATIONS_DATASETS
+        )
         for aug_cfg in cfg.augmentations:
-            if cfg.mixed_channels:
+            if use_albumentations_pipeline:
                 pipelines.append(
                     NCropAlbumentationAugmentation(
                         build_transform_pipeline(cfg.data.dataset, aug_cfg),
@@ -198,6 +232,14 @@ def main(cfg: DictConfig):
             data_fraction=cfg.data.fraction,
             return_val_dataset=cfg.ssl_val_loss,
             sample_ratio=cfg.data.sample_ratio,
+            wds_train_pattern=cfg.data.wds_train_pattern,
+            wds_val_pattern=cfg.data.wds_val_pattern,
+            wds_channels=cfg.data.wds_channels,
+            wds_count_mode=cfg.data.wds_count_mode,
+            wds_estimate_n_shards=cfg.data.wds_estimate_n_shards,
+            wds_estimated_samples=cfg.data.wds_estimated_samples,
+            wds_min_channels=cfg.data.wds_min_channels,
+            wds_require_all_channels=cfg.data.wds_require_all_channels,
         )
 
         train_loader = prepare_dataloader(
@@ -293,14 +335,21 @@ def main(cfg: DictConfig):
     trainer_kwargs = {
         name: trainer_kwargs[name] for name in valid_kwargs if name in trainer_kwargs
     }
+    # DINO / momentum teacher 等 SSL：部分参数当步不参与 student loss 的反向，DDP 默认
+    # find_unused_parameters=False 会报错；多卡时须打开或显式使用 ddp_find_unused_parameters_true。
+    _strat = cfg.strategy
+    _nd = _num_devices(cfg)
+    if _strat == "ddp" or (_strat == "auto" and _nd > 1):
+        _pl_strategy = DDPStrategy(find_unused_parameters=True)
+    else:
+        _pl_strategy = _strat
+
     trainer_kwargs.update(
         {
             "logger": logger if cfg.wandb.enabled else None,
             "callbacks": callbacks,
             "enable_checkpointing": False,
-            "strategy": DDPStrategy(find_unused_parameters=False)
-            if cfg.strategy == "ddp"
-            else cfg.strategy,
+            "strategy": _pl_strategy,
             "plugins": [SLURMEnvironment(requeue_signal=signal.SIGUSR1)]
             if cfg.slurm.enabled
             else None,

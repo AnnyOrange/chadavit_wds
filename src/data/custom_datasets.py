@@ -21,19 +21,32 @@
 import io
 import os
 import csv
+import json
 import random
+import tarfile
 import numpy as np
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Iterator, List, Dict, Tuple
 
 import h5py
 from PIL import Image
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from torchvision.transforms import *
 from src.utils import *
 from src.utils.misc import imread
+
+
+def _apply_transform_compat(transform: Callable, image_array: np.ndarray):
+    """Apply transform for both albumentations-style and callable-style pipelines."""
+    try:
+        return transform(image=image_array)
+    except TypeError as error:
+        if "unexpected keyword argument 'image'" not in str(error):
+            raise
+        return transform(image_array)
 
 
 class H5Dataset(Dataset):
@@ -173,15 +186,25 @@ class IDRCell100K(Dataset):
         image_channels = []
         for file_path in file_paths:
             image = Image.open(file_path)
-            channel_array = np.array(image)[
-                :, :, np.newaxis
-            ]  # Add a new axis to make it 3-dimensional
+            channel_array = np.array(image)
+
+            # Keep bit-depth semantics and map to [0, 1].
+            if channel_array.dtype == np.uint16:
+                channel_array = channel_array.astype(np.float32) / 65535.0
+            elif channel_array.dtype == np.uint8:
+                channel_array = channel_array.astype(np.float32) / 255.0
+            else:
+                channel_array = channel_array.astype(np.float32)
+
+            # Add a new axis to make it 3-dimensional.
+            if channel_array.ndim == 2:
+                channel_array = channel_array[:, :, np.newaxis]
             image_channels.append(channel_array)
 
         image_array = np.concatenate(image_channels, axis=2).astype(np.float32)
 
         if self.transform is not None:
-            augmented_image = self.transform(image=image_array)
+            augmented_image = _apply_transform_compat(self.transform, image_array)
 
         # ========= IF YOU WANT TO VIZUALIZE THE TRANSFORMATION YOU DO ========= #
         # if self.train:
@@ -220,6 +243,270 @@ class IDRCell100K(Dataset):
         return file_list
 
 
+class WDSPackedShards(IterableDataset):
+    """Iterable dataset that streams multi-channel TIFF samples from WDS-like tar shards.
+
+    Expected shard members for each sample key:
+        <sample_key>.ch1.tif
+        <sample_key>.ch2.tif
+        <sample_key>.ch3.tif
+        <sample_key>.meta.json   # optional, ignored by this loader
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        train: bool = True,
+        transform: Optional[Callable] = None,
+        sample_ratio: float = 1.0,
+        train_shard_pattern: str = "filtered_mixed_train_w*.tar",
+        val_shard_pattern: str = "filtered_mixed_val_w*.tar",
+        channels: int = 3,
+        cache_counts: bool = True,
+        count_mode: str = "estimate",
+        estimate_n_shards: int = 2,
+        estimated_samples: Optional[int] = None,
+        min_channels: int = 1,
+        require_all_channels: bool = False,
+    ):
+        self.root_dir = root_dir
+        self.train = train
+        self.transform = transform
+        self.sample_ratio = sample_ratio
+        self.channels = channels
+        self.cache_counts = cache_counts
+        self.count_mode = count_mode
+        self.estimate_n_shards = max(1, estimate_n_shards)
+        self.estimated_samples = estimated_samples
+        self.min_channels = min_channels
+        self.require_all_channels = require_all_channels
+        self.train_shard_pattern = train_shard_pattern
+        self.val_shard_pattern = val_shard_pattern
+
+        if not 0 < self.sample_ratio <= 1.0:
+            raise ValueError("sample_ratio must be in (0, 1].")
+
+        self.shards = self._collect_shards()
+        if not self.shards:
+            split = "train" if self.train else "val"
+            raise RuntimeError(
+                f"No shards found for split='{split}' under '{self.root_dir}'. "
+                f"Patterns checked: '{self._get_pattern()}'"
+            )
+
+        self._length = int(self._estimate_num_samples() * self.sample_ratio)
+        if self._length <= 0:
+            raise RuntimeError(
+                "Estimated dataset length is 0. Check shard contents and sample_ratio."
+            )
+
+    def _get_pattern(self) -> str:
+        return self.train_shard_pattern if self.train else self.val_shard_pattern
+
+    def _collect_shards(self) -> List[str]:
+        pattern = self._get_pattern()
+        shard_paths = sorted(str(path) for path in Path(self.root_dir).glob(pattern))
+        # fallback: if val shards are absent, reuse train shards for validation
+        if not shard_paths and not self.train:
+            shard_paths = sorted(
+                str(path) for path in Path(self.root_dir).glob(self.train_shard_pattern)
+            )
+        return shard_paths
+
+    def _count_cache_path(self) -> str:
+        split = "train" if self.train else "val"
+        return os.path.join(self.root_dir, f".wds_count_cache_{split}.json")
+
+    def _load_count_cache(self) -> Optional[Dict]:
+        cache_path = self._count_cache_path()
+        if not self.cache_counts or not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            if (
+                cache.get("pattern") == self._get_pattern()
+                and cache.get("channels") == self.channels
+                and cache.get("shards") == self.shards
+            ):
+                return cache
+        except Exception:
+            return None
+        return None
+
+    def _save_count_cache(self, per_shard_counts: Dict[str, int], total_count: int):
+        if not self.cache_counts:
+            return
+        cache = {
+            "pattern": self._get_pattern(),
+            "channels": self.channels,
+            "shards": self.shards,
+            "per_shard_counts": per_shard_counts,
+            "total_count": total_count,
+        }
+        try:
+            with open(self._count_cache_path(), "w") as f:
+                json.dump(cache, f)
+        except Exception:
+            # cache write failure should not block training
+            pass
+
+    def _estimate_num_samples(self) -> int:
+        if self.estimated_samples is not None:
+            return int(self.estimated_samples)
+
+        cache = self._load_count_cache()
+        if cache is not None:
+            return int(cache["total_count"])
+
+        per_shard_counts = {}
+        ch1_suffix = ".ch1.tif"
+        if self.count_mode == "exact":
+            total_count = 0
+            shard_paths = self.shards
+            for shard_path in shard_paths:
+                count = 0
+                with tarfile.open(shard_path, "r") as tar:
+                    for member in tar:
+                        if member.isfile() and member.name.endswith(ch1_suffix):
+                            count += 1
+                per_shard_counts[shard_path] = count
+                total_count += count
+        else:
+            shard_paths = self.shards[: self.estimate_n_shards]
+            sample_total = 0
+            for shard_path in shard_paths:
+                count = 0
+                with tarfile.open(shard_path, "r") as tar:
+                    for member in tar:
+                        if member.isfile() and member.name.endswith(ch1_suffix):
+                            count += 1
+                per_shard_counts[shard_path] = count
+                sample_total += count
+            avg_per_shard = sample_total / max(1, len(shard_paths))
+            total_count = int(avg_per_shard * len(self.shards))
+
+        self._save_count_cache(per_shard_counts, total_count)
+        return total_count
+
+    def __len__(self) -> int:
+        return self._length
+
+    def _decode_image(self, image_bytes: bytes) -> np.ndarray:
+        image = Image.open(io.BytesIO(image_bytes))
+        channel_array = np.array(image, dtype=np.float32)
+        return channel_array
+
+    def _iter_shard(self, shard_path: str) -> Iterator[Tuple[np.ndarray, int]]:
+        """Yields (image, dummy_label) from a shard."""
+
+        # Keys are sample prefixes, values are {channel_id: ndarray}
+        sample_buffers: Dict[str, Dict[int, np.ndarray]] = {}
+        meta_suffix = ".meta.json"
+
+        def materialize_sample(channel_map: Dict[int, np.ndarray]):
+            channel_ids = sorted(
+                channel_id
+                for channel_id in channel_map.keys()
+                if 1 <= channel_id <= self.channels
+            )
+            if self.require_all_channels:
+                required = list(range(1, self.channels + 1))
+                if not all(channel_id in channel_map for channel_id in required):
+                    return None
+                channel_ids = required
+            elif len(channel_ids) < self.min_channels:
+                return None
+
+            image_channels = [
+                channel_map[channel_id][:, :, np.newaxis] for channel_id in channel_ids
+            ]
+            image_array = np.concatenate(image_channels, axis=2).astype(np.float32)
+            if self.transform is not None:
+                augmented_image = _apply_transform_compat(self.transform, image_array)
+            else:
+                augmented_image = {"image": image_array}
+            return augmented_image, -1
+
+        with tarfile.open(shard_path, "r") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+
+                name = os.path.basename(member.name)
+                if name.endswith(meta_suffix):
+                    prefix = name[: -len(meta_suffix)]
+                    channel_map = sample_buffers.pop(prefix, {})
+                    sample = materialize_sample(channel_map)
+                    if sample is not None:
+                        yield sample
+                    continue
+
+                # Keep only channel files (e.g. xxx.ch2.tif)
+                if not name.endswith(".tif") or ".ch" not in name:
+                    continue
+
+                prefix, channel_suffix = name.rsplit(".ch", 1)
+                channel_id_str = channel_suffix.split(".")[0]
+                if not channel_id_str.isdigit():
+                    continue
+                channel_id = int(channel_id_str)
+                if channel_id < 1 or channel_id > self.channels:
+                    continue
+
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+
+                channel_array = self._decode_image(extracted.read())
+                sample_buffers.setdefault(prefix, {})[channel_id] = channel_array
+
+        # Fallback for shards without meta files.
+        for channel_map in sample_buffers.values():
+            sample = materialize_sample(channel_map)
+            if sample is not None:
+                yield sample
+
+    def __iter__(self) -> Iterator[Tuple[np.ndarray, int]]:
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        shard_subset = self.shards[worker_id::num_workers]
+        if not shard_subset:
+            return iter(())
+
+        rng = random.Random(torch.initial_seed() + worker_id)
+        if self.train:
+            rng.shuffle(shard_subset)
+
+        yielded = 0
+        target = self._length // max(1, num_workers)
+        # give leftover samples to worker 0
+        if worker_id == 0:
+            target += self._length % max(1, num_workers)
+
+        for shard_path in shard_subset:
+            for sample in self._iter_shard(shard_path):
+                yield sample
+                yielded += 1
+                if yielded >= target:
+                    return
+
+        # If we did not reach target (e.g., truncated split), cycle shards once more.
+        if yielded < target:
+            for shard_path in shard_subset:
+                for sample in self._iter_shard(shard_path):
+                    yield sample
+                    yielded += 1
+                    if yielded >= target:
+                        return
+
+
 class IDRCell100K_3Channels(Dataset):
     """
     Used only for a baseline comparison with a Standard ViT trained on 3 channels images.
@@ -255,7 +542,7 @@ class IDRCell100K_3Channels(Dataset):
         image_array = np.concatenate(image_channels, axis=2).astype(np.float32)
 
         if self.transform is not None:
-            augmented_image = self.transform(image=image_array)
+            augmented_image = _apply_transform_compat(self.transform, image_array)
 
         # ========= IF YOU WANT TO VIZUALIZE THE TRANSFORMATION YOU DO ========= #
         # if self.train:
@@ -319,7 +606,7 @@ class Bray(Dataset):
         image_array = image_array["sample"].astype(np.float32)
 
         if self.transform is not None:
-            augmented_image = self.transform(image=image_array)
+            augmented_image = _apply_transform_compat(self.transform, image_array)
 
         # ========= IF YOU WANT TO VIZUALIZE THE TRANSFORMATION YOU DO ========= #
         # if self.train:
@@ -421,7 +708,7 @@ class BBBC021xBray(Dataset):
         image_array = image_array.astype(np.float32)
 
         if self.transform is not None:
-            augmented_image = self.transform(image=image_array)
+            augmented_image = _apply_transform_compat(self.transform, image_array)
 
         # ========= IF YOU WANT TO VIZUALIZE THE TRANSFORMATION YOU DO ========= #
         # if self.train:

@@ -29,7 +29,7 @@ import torchvision
 from PIL import Image, ImageFilter, ImageOps
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.utils.data import DataLoader
-from torch.utils.data.dataset import Dataset
+from torch.utils.data.dataset import Dataset, IterableDataset
 from torchvision import transforms
 from torchvision.datasets import STL10, ImageFolder
 import albumentations as A
@@ -38,7 +38,12 @@ import cv2
 
 # Local imports
 from src.data.channels_strategies import RandomDiscarder, one_channel_collate_fn
-from src.data.custom_datasets import IDRCell100K, IDRCell100K_3Channels, Bray
+from src.data.custom_datasets import (
+    IDRCell100K,
+    IDRCell100K_3Channels,
+    Bray,
+    WDSPackedShards,
+)
 from src.data.custom_transforms import CustomColorJitter
 
 try:
@@ -269,7 +274,12 @@ def build_transform_pipeline(dataset, cfg):
 
     augmentations = []
 
-    if dataset == "idrcell100k" or dataset == "idrcell100k_3channels" or dataset == "bray":
+    if (
+        dataset == "idrcell100k"
+        or dataset == "idrcell100k_3channels"
+        or dataset == "bray"
+        or dataset == "wds_packed_shards"
+    ):
         if cfg.rrc.enabled:
             augmentations.append(
                 A.augmentations.crops.transforms.RandomResizedCrop(
@@ -322,7 +332,14 @@ def build_transform_pipeline(dataset, cfg):
 
         augmentations.append(ToTensorV2())
         if cfg.normalize:
-            augmentations.append(A.Normalize(mean=mean, std=std, p=cfg.normalize.prob))
+            augmentations.append(
+                A.Normalize(
+                    mean=mean,
+                    std=std,
+                    max_pixel_value=1.0,
+                    p=cfg.normalize.prob,
+                )
+            )
 
         augmentations = A.Compose(augmentations)
         return augmentations
@@ -411,6 +428,14 @@ def prepare_datasets(
     data_fraction: float = -1.0,
     return_val_dataset: bool = False,
     sample_ratio: float = 1.0,
+    wds_train_pattern: str = "filtered_mixed_train_w*.tar",
+    wds_val_pattern: str = "filtered_mixed_val_w*.tar",
+    wds_channels: int = 3,
+    wds_count_mode: str = "estimate",
+    wds_estimate_n_shards: int = 2,
+    wds_estimated_samples: Optional[int] = None,
+    wds_min_channels: int = 1,
+    wds_require_all_channels: bool = False,
 ) -> Dataset:
     """
     Prepares the desired dataset(s).
@@ -471,6 +496,37 @@ def prepare_datasets(
         if return_val_dataset:
             val_dataset = dataset_with_index(Bray)(root_dir=val_data_path, train=False, transform=transform)
 
+    elif dataset == "wds_packed_shards":
+        train_dataset = WDSPackedShards(
+            root_dir=train_data_path,
+            train=True,
+            transform=transform,
+            sample_ratio=sample_ratio,
+            train_shard_pattern=wds_train_pattern,
+            val_shard_pattern=wds_val_pattern,
+            channels=wds_channels,
+            count_mode=wds_count_mode,
+            estimate_n_shards=wds_estimate_n_shards,
+            estimated_samples=wds_estimated_samples,
+            min_channels=wds_min_channels,
+            require_all_channels=wds_require_all_channels,
+        )
+        if return_val_dataset:
+            val_dataset = WDSPackedShards(
+                root_dir=val_data_path if val_data_path is not None else train_data_path,
+                train=False,
+                transform=transform,
+                sample_ratio=sample_ratio,
+                train_shard_pattern=wds_train_pattern,
+                val_shard_pattern=wds_val_pattern,
+                channels=wds_channels,
+                count_mode=wds_count_mode,
+                estimate_n_shards=wds_estimate_n_shards,
+                estimated_samples=wds_estimated_samples,
+                min_channels=wds_min_channels,
+                require_all_channels=wds_require_all_channels,
+            )
+
     if data_fraction > 0:
         assert data_fraction < 1, "Only use data_fraction for values smaller than 1."
         from sklearn.model_selection import train_test_split
@@ -513,6 +569,9 @@ def prepare_dataloader(
         collate_fn = None
     elif channel_strategy == "one_channel" or channel_strategy == "multi_channels":
         collate_fn = one_channel_collate_fn
+
+    if isinstance(dataset, IterableDataset):
+        shuffle = False
 
     data_loader = DataLoader(
         dataset,

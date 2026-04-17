@@ -41,6 +41,7 @@ _SUPPORTED_DATASETS = [
     "imagenet100",
     "idrcell100k",
     "idrcell100k_3channels",
+    "wds_packed_shards",
     "bloodmnist",
     "bbbc021",
     "bbbc048",
@@ -74,6 +75,24 @@ def add_and_assert_dataset_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfi
     cfg.debug_augmentations = omegaconf_select(cfg, "debug_augmentations", False)
     cfg.data.img_channels = omegaconf_select(cfg, "data.img_channels", 3)
     cfg.data.sample_ratio = omegaconf_select(cfg, "data.sample_ratio", 1.0)
+    cfg.data.wds_train_pattern = omegaconf_select(
+        cfg, "data.wds_train_pattern", "filtered_mixed_train_w*.tar"
+    )
+    cfg.data.wds_val_pattern = omegaconf_select(
+        cfg, "data.wds_val_pattern", "filtered_mixed_val_w*.tar"
+    )
+    cfg.data.wds_channels = omegaconf_select(cfg, "data.wds_channels", cfg.data.img_channels)
+    cfg.data.wds_count_mode = omegaconf_select(cfg, "data.wds_count_mode", "estimate")
+    cfg.data.wds_estimate_n_shards = omegaconf_select(
+        cfg, "data.wds_estimate_n_shards", 2
+    )
+    cfg.data.wds_estimated_samples = omegaconf_select(
+        cfg, "data.wds_estimated_samples", None
+    )
+    cfg.data.wds_min_channels = omegaconf_select(cfg, "data.wds_min_channels", 1)
+    cfg.data.wds_require_all_channels = omegaconf_select(
+        cfg, "data.wds_require_all_channels", False
+    )
 
     return cfg
 
