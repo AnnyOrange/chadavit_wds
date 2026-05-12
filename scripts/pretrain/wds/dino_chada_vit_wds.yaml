@@ -31,7 +31,7 @@ backbone:
 method_kwargs:
   proj_hidden_dim: 2048
   proj_output_dim: 256
-  num_prototypes: 4096
+  num_prototypes: 65536
   warmup_teacher_temperature_epochs: 50
 
 momentum:
@@ -125,6 +125,9 @@ optimizer:
   lr: 0.3
   classifier_lr: 0.1
   weight_decay: 1e-6
+  scale_lr_with_accum: false
+  # Keep false unless you intentionally want LR multiplied by accumulate_grad_batches.
+  allow_high_lr_with_accum: false
   kwargs:
     clip_lr: True
     eta: 0.02
@@ -135,7 +138,7 @@ scheduler:
 
 checkpoint:
   enabled: true
-  dir: "trained_models_full_900G"
+  dir: "trained_models_full1TB_np65536_n1"
   frequency: 5
   keep_prev: true
 
@@ -152,3 +155,5 @@ devices: [0,1,2,3,4,5,6,7]
 sync_batchnorm: true
 accelerator: "gpu"
 strategy: "ddp"
+# 全局 batch ≈ optimizer.batch_size × devices × accumulate_grad_batches；2048@32×8 卡 → 8
+accumulate_grad_batches: 1

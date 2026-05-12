@@ -306,10 +306,6 @@ class CustomColorJitter(A.ImageOnlyTransform):
         self.gamma_min = gamma_min
         self.gamma_max = gamma_max
 
-    def __call__(self, image, **kwargs):
-        transformed_image = self.apply(img=image)
-        return {'image': transformed_image}
-
     def apply(self, img, **params):
         # Get the number of channels in the image
         num_channels = img.shape[-1]
@@ -351,7 +347,7 @@ class CustomColorJitter(A.ImageOnlyTransform):
         return adjusted_image
 
     def update_params(self, params, **kwargs):
-        pass  # No parameter updates needed
+        return params
 
     def get_params(self):
         return {

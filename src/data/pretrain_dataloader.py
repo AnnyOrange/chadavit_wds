@@ -330,7 +330,6 @@ def build_transform_pipeline(dataset, cfg):
         if cfg.horizontal_flip.prob:
             augmentations.append(A.HorizontalFlip(p=cfg.horizontal_flip.prob))
 
-        augmentations.append(ToTensorV2())
         if cfg.normalize:
             augmentations.append(
                 A.Normalize(
@@ -340,6 +339,7 @@ def build_transform_pipeline(dataset, cfg):
                     p=cfg.normalize.prob,
                 )
             )
+        augmentations.append(ToTensorV2())
 
         augmentations = A.Compose(augmentations)
         return augmentations

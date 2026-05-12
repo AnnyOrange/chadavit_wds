@@ -23,6 +23,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 import json
+import os
 from typing import Tuple
 
 import torch
@@ -162,6 +163,10 @@ def main(cfg: DictConfig):
     cfg = parse_cfg(cfg)
 
     seed_everything_manual(cfg.seed)
+    if os.environ.get("CHADAVIT_DISABLE_CUDNN", "0") == "1":
+        torch.backends.cudnn.enabled = False
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     assert cfg.method in METHODS, f"Choose from {METHODS.keys()}"
 
@@ -172,7 +177,7 @@ def main(cfg: DictConfig):
     # load imagenet weights
     if ckpt_path == "imagenet-weights" or ckpt_path == "random-weights":
         model = METHODS[cfg.method](cfg)
-        model.cuda()
+        model.to(device)
 
     # load custom pretrained weights
     else:
@@ -184,22 +189,69 @@ def main(cfg: DictConfig):
         args_path = ckpt_dir + "/args.json"
 
         # load arguments
-        with open(args_path) as f:
-            method_args = json.load(f)
-        cfg_pretrained_model = OmegaConf.create(method_args)
+        ckpt_name = os.path.basename(ckpt_path).lower()
+        use_runtime_cfg = "official" in ckpt_name
+        if os.path.isfile(args_path) and not use_runtime_cfg:
+            with open(args_path) as f:
+                method_args = json.load(f)
+            cfg_pretrained_model = OmegaConf.create(method_args)
+        else:
+            print(
+                f"[warning] Using current run config for checkpoint loading. "
+                f"args.json path: {args_path}, use_runtime_cfg={use_runtime_cfg}"
+            )
+            cfg_pretrained_model = OmegaConf.create(
+                OmegaConf.to_container(cfg, resolve=True)
+            )
 
         # FOR MODELS TRAINED BEFORE IMPLEMENTATION OF CERTAIN PARAMETERS
         cfg_pretrained_model.optimizer.token_learner_lr = omegaconf_select(cfg, "optimizer.token_learner_lr", None)
         cfg_pretrained_model.ssl_val_loss = omegaconf_select(cfg, "ssl_val_loss", False)
         cfg_pretrained_model.backbone.kwargs.return_all_tokens = omegaconf_select(cfg, "backbone.kwargs.return_all_tokens", False)
 
-        model = METHODS[cfg.method](cfg).load_from_checkpoint(ckpt_path, strict=False, cfg=cfg_pretrained_model)
+        if use_runtime_cfg:
+            # For official checkpoints, rely on checkpoint-embedded hyperparameters
+            # to avoid architecture mismatches (e.g., num_prototypes, channel tokens).
+            ckpt_obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state = ckpt_obj.get("state_dict", {})
+
+            # Start from current run cfg and patch architecture-critical fields
+            # using checkpoint tensor shapes.
+            ckpt_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+
+            ch_token = state.get("backbone.channel_token", None)
+            if ch_token is not None and hasattr(ch_token, "shape") and len(ch_token.shape) >= 2:
+                inferred_max_ch = int(ch_token.shape[1])
+                ckpt_cfg.data.max_img_channels = inferred_max_ch
+                ckpt_cfg.backbone.kwargs.max_number_channels = inferred_max_ch
+
+            proto_wg = state.get("head.last_layer.weight_g", None)
+            if proto_wg is not None and hasattr(proto_wg, "shape") and len(proto_wg.shape) >= 1:
+                ckpt_cfg.method_kwargs.num_prototypes = int(proto_wg.shape[0])
+
+            clf_w = state.get("classifier.weight", None)
+            if clf_w is not None and hasattr(clf_w, "shape") and len(clf_w.shape) >= 1:
+                ckpt_cfg.data.num_classes = int(clf_w.shape[0])
+
+            model = METHODS[cfg.method](cfg).load_from_checkpoint(
+                ckpt_path,
+                strict=False,
+                cfg=ckpt_cfg,
+                map_location=device,
+            )
+        else:
+            model = METHODS[cfg.method](cfg).load_from_checkpoint(
+                ckpt_path,
+                strict=False,
+                cfg=cfg_pretrained_model,
+                map_location=device,
+            )
 
         # modify first layer AFTER loading pretrained weights for Standard architecture (trained on 3-Channels/RGB images)
         if not (cfg.channels_strategy == "one_channel" or cfg.channels_strategy == "multi_channels"):
             model.backbone = modify_first_layer(backbone=model.backbone, cfg=cfg, pretrained=False)
         
-        model.cuda()
+        model.to(device)
 
     # prepare data
     _, T = prepare_transforms(cfg.data.dataset)

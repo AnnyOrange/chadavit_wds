@@ -71,6 +71,8 @@ def main(cfg: DictConfig):
     cfg = parse_cfg(cfg)
 
     seed_everything(cfg.seed)
+    if os.environ.get("CHADAVIT_DISABLE_CUDNN", "0") == "1":
+        torch.backends.cudnn.enabled = False
 
     # initialize backbone
     backbone_model = BaseMethod._BACKBONES[cfg.backbone.name]
@@ -230,6 +232,7 @@ def main(cfg: DictConfig):
         )
         callbacks.append(ckpt)
 
+    logger = None
     # wandb logging
     if cfg.wandb.enabled:
         if not cfg.slurm.enabled:
@@ -310,6 +313,14 @@ def main(cfg: DictConfig):
         trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
 
     print("TRAINING FINISHED")
+    metrics = trainer.callback_metrics
+    val_acc1 = metrics.get("val_acc1")
+    val_acc5 = metrics.get("val_acc5")
+    if val_acc1 is not None and val_acc5 is not None:
+        print(
+            f"FINAL_METRICS val_acc1={float(val_acc1):.8f} "
+            f"val_acc5={float(val_acc5):.8f}"
+        )
 
     # Workaround to log metrics to wandb at the end of a full run when using slurm autoresubmit
     if isinstance(logger, SLURMLogger) and cfg.slurm.enabled and _idr_torch_available:

@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple, Union
 import omegaconf
 import pytorch_lightning as pl
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from src.backbones import (
@@ -134,8 +135,9 @@ class BaseMethod(pl.LightningModule):
             workers).
 
         .. note::
-            The learning rate (base, min and warmup) is automatically scaled linearly
-            if using gradient accumulation.
+            When ``optimizer.scale_lr_with_accum`` is True, the learning rate (base, min and
+            warmup) is scaled linearly by ``accumulate_grad_batches``. By default this is False,
+            so accumulation does not change the nominal LR (Lightning still applies accumulation).
 
         .. note::
             For CIFAR10/100, the first convolutional and maxpooling layers of the ResNet backbone
@@ -246,6 +248,32 @@ class BaseMethod(pl.LightningModule):
         self.extra_optimizer_args: Dict[str, Any] = cfg.optimizer.kwargs
         self.exclude_bias_n_norm_wd: bool = cfg.optimizer.exclude_bias_n_norm_wd
 
+        # Whether to linearly scale LR with accumulate_grad_batches (legacy behavior).
+        # When False (default), accumulation only affects batch size semantics via Lightning;
+        # effective LR stays at cfg.optimizer.lr unless you enable this.
+        self.scale_lr_with_accum: bool = omegaconf_select(
+            cfg, "optimizer.scale_lr_with_accum", False
+        )
+        self.allow_high_lr_with_accum: bool = omegaconf_select(
+            cfg, "optimizer.allow_high_lr_with_accum", False
+        )
+
+        # Safety guard: avoid accidentally blowing up effective LR when using
+        # gradient accumulation (common source of unstable SSL pretraining).
+        if (
+            self.accumulate_grad_batches
+            and self.accumulate_grad_batches > 1
+            and self.scale_lr_with_accum
+            and not self.allow_high_lr_with_accum
+        ):
+            print(
+                "[LR setup] WARNING: optimizer.scale_lr_with_accum=true with "
+                f"accumulate_grad_batches={self.accumulate_grad_batches}. "
+                "Auto-disabling LR scaling to avoid oversized effective LR. "
+                "Set optimizer.allow_high_lr_with_accum=true to force-enable."
+            )
+            self.scale_lr_with_accum = False
+
         # scheduler related
         self.scheduler: str = cfg.scheduler.name
         self.lr_decay_steps: Union[List[int], None] = cfg.scheduler.lr_decay_steps
@@ -255,8 +283,8 @@ class BaseMethod(pl.LightningModule):
         self.scheduler_interval: str = cfg.scheduler.interval
         assert self.scheduler_interval in ["step", "epoch"]
 
-        # if accumulating gradient then scale lr
-        if self.accumulate_grad_batches:
+        # Only scale LRs when explicitly requested (decouples accum from LR).
+        if self.accumulate_grad_batches and self.scale_lr_with_accum:
             self.lr = self.lr * self.accumulate_grad_batches
             self.classifier_lr = (
                 self.classifier_lr * self.accumulate_grad_batches
@@ -270,6 +298,22 @@ class BaseMethod(pl.LightningModule):
             )
             self.min_lr = self.min_lr * self.accumulate_grad_batches
             self.warmup_start_lr = self.warmup_start_lr * self.accumulate_grad_batches
+
+        if dist.is_available() and dist.is_initialized():
+            _lr_log_rank = dist.get_rank() == 0
+        else:
+            _lr_log_rank = True
+        if _lr_log_rank:
+            print(
+                "[LR setup] "
+                f"batch_size(per_gpu)={self.batch_size}, "
+                f"accumulate_grad_batches={self.accumulate_grad_batches}, "
+                f"scale_lr_with_accum={self.scale_lr_with_accum}, "
+                f"allow_high_lr_with_accum={self.allow_high_lr_with_accum}, "
+                f"lr={self.lr}, classifier_lr={self.classifier_lr}, "
+                f"token_learner_lr={self.token_learner_lr}, "
+                f"min_lr={self.min_lr}, warmup_start_lr={self.warmup_start_lr}"
+            )
 
         # data-related
         self.num_large_crops: int = cfg.data.num_large_crops
@@ -321,6 +365,13 @@ class BaseMethod(pl.LightningModule):
         )
         # default for extra optimizer kwargs (use pytorch's default if not available)
         cfg.optimizer.kwargs = omegaconf_select(cfg, "optimizer.kwargs", {})
+
+        cfg.optimizer.scale_lr_with_accum = omegaconf_select(
+            cfg, "optimizer.scale_lr_with_accum", False
+        )
+        cfg.optimizer.allow_high_lr_with_accum = omegaconf_select(
+            cfg, "optimizer.allow_high_lr_with_accum", False
+        )
 
         # default for acc grad batches
         cfg.accumulate_grad_batches = omegaconf_select(
@@ -919,8 +970,8 @@ class BaseMethod(pl.LightningModule):
         else:
             X, targets = batch
 
-        # Manually move to cuda
-        X = X.cuda(non_blocking=True)
+        # Move batch to the same device as the module.
+        X = X.to(self.device, non_blocking=True)
 
         outs = self._base_extract_step(X, index=0)  # we only have one crop so index=0
 

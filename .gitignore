@@ -2,3 +2,13 @@ trained_models_full_900G
 trained_models
 lightning_logs
 __pycache__
+eval_results
+eval_data
+trained_models_full1TB_np65536_in
+trained_models_full1TB_np65536
+trained_models_full1TB
+trained_models_full1TB_np65536_weakaug
+update.bundle
+trained_models_full1TB_np65536_n1/
+wandb/
+.codex

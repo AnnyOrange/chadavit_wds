@@ -31,6 +31,7 @@ from typing import Callable, Optional, Iterator, List, Dict, Tuple
 import h5py
 from PIL import Image
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from tqdm import tqdm
 
@@ -47,6 +48,20 @@ def _apply_transform_compat(transform: Callable, image_array: np.ndarray):
         if "unexpected keyword argument 'image'" not in str(error):
             raise
         return transform(image_array)
+
+
+def _to_uint8_for_pil(channel_array: np.ndarray) -> np.ndarray:
+    """Convert a single-channel array to uint8 while handling 8-bit/16-bit inputs explicitly."""
+    if channel_array.dtype == np.uint8:
+        return channel_array
+    if channel_array.dtype == np.uint16:
+        return np.round(channel_array.astype(np.float32) / 65535.0 * 255.0).astype(
+            np.uint8
+        )
+    channel_array = channel_array.astype(np.float32)
+    if channel_array.size > 0 and channel_array.max() <= 1.0:
+        channel_array = channel_array * 255.0
+    return np.clip(channel_array, 0.0, 255.0).astype(np.uint8)
 
 
 class H5Dataset(Dataset):
@@ -389,13 +404,46 @@ class WDSPackedShards(IterableDataset):
         self._save_count_cache(per_shard_counts, total_count)
         return total_count
 
+    @staticmethod
+    def _distributed_info() -> Tuple[int, int]:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
+    @staticmethod
+    def _split_target(total: int, index: int, parts: int) -> int:
+        base = total // max(1, parts)
+        remainder = total % max(1, parts)
+        return base + (1 if index < remainder else 0)
+
     def __len__(self) -> int:
-        return self._length
+        rank, world_size = self._distributed_info()
+        return self._split_target(self._length, rank, world_size)
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray:
         image = Image.open(io.BytesIO(image_bytes))
-        channel_array = np.array(image, dtype=np.float32)
-        return channel_array
+        channel_array = np.array(image)
+
+        # Keep WDS inputs in [0, 1] for multi-channel augmentations.
+        # CustomColorJitter clamps float images to [0, 1], so feeding raw uint16
+        # ranges would saturate most pixels and destroy signal.
+        if channel_array.dtype == np.uint16:
+            return channel_array.astype(np.float32) / 65535.0
+        if channel_array.dtype == np.uint8:
+            return channel_array.astype(np.float32) / 255.0
+
+        channel_array = channel_array.astype(np.float32)
+        if channel_array.size == 0:
+            return channel_array
+
+        vmax = float(np.max(channel_array))
+        if vmax <= 1.0:
+            return np.clip(channel_array, 0.0, 1.0)
+        if vmax <= 255.0:
+            return np.clip(channel_array / 255.0, 0.0, 1.0)
+        if vmax <= 65535.0:
+            return np.clip(channel_array / 65535.0, 0.0, 1.0)
+        return np.clip(channel_array / vmax, 0.0, 1.0)
 
     def _iter_shard(self, shard_path: str) -> Iterator[Tuple[np.ndarray, int]]:
         """Yields (image, dummy_label) from a shard."""
@@ -476,19 +524,20 @@ class WDSPackedShards(IterableDataset):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
-        shard_subset = self.shards[worker_id::num_workers]
+        rank, world_size = self._distributed_info()
+        global_worker_id = rank * num_workers + worker_id
+        total_workers = world_size * num_workers
+
+        shard_subset = self.shards[global_worker_id::total_workers]
         if not shard_subset:
             return iter(())
 
-        rng = random.Random(torch.initial_seed() + worker_id)
+        rng = random.Random(torch.initial_seed() + global_worker_id)
         if self.train:
             rng.shuffle(shard_subset)
 
         yielded = 0
-        target = self._length // max(1, num_workers)
-        # give leftover samples to worker 0
-        if worker_id == 0:
-            target += self._length % max(1, num_workers)
+        target = self._split_target(self._length, global_worker_id, total_workers)
 
         for shard_path in shard_subset:
             for sample in self._iter_shard(shard_path):
@@ -534,7 +583,7 @@ class IDRCell100K_3Channels(Dataset):
         image_channels = []
         for file_path in file_paths:
             image = Image.open(file_path)
-            channel_array = np.array(image)[
+            channel_array = _to_uint8_for_pil(np.array(image))[
                 :, :, np.newaxis
             ]  # Add a new axis to make it 3-dimensional
             image_channels.append(channel_array)
@@ -1257,8 +1306,7 @@ class CyclOPS(Dataset):
         for channel_name in channel_names:
             channel_file_path = file_path.replace(".tif", f"_{channel_name}.tif")
             image = Image.open(channel_file_path)
-            image = np.clip(image, 0, 255).astype(np.uint8)
-            channel_array = np.array(image)[
+            channel_array = _to_uint8_for_pil(np.array(image))[
                 :, :, np.newaxis
             ]  # Add a new axis to make it 3-dimensional
             image_channels.append(channel_array)

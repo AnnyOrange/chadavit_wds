@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 import json
 import os
+import re
 from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,6 +47,12 @@ class AutoResumer:
         self.max_hours = timedelta(hours=max_hours)
 
     @staticmethod
+    def _checkpoint_sort_key(checkpoint: Path):
+        match = re.search(r"ep=(\d+)\.ckpt$", checkpoint.name)
+        epoch = int(match.group(1)) if match else -1
+        return epoch, checkpoint.stat().st_mtime
+
+    @staticmethod
     def add_and_assert_specific_cfg(cfg: DictConfig) -> DictConfig:
         """Adds specific default values/checks for config.
 
@@ -76,10 +83,12 @@ class AutoResumer:
             rootdir = Path(rootdir)
             if files:
                 # skip checkpoints that are empty
-                try:
-                    checkpoint_file = [rootdir / f for f in files if f.endswith(".ckpt")][0]
-                except:
+                checkpoint_files = [rootdir / f for f in files if f.endswith(".ckpt")]
+                if not checkpoint_files:
                     continue
+                checkpoint_file = max(
+                    checkpoint_files, key=AutoResumer._checkpoint_sort_key
+                )
 
                 creation_time = datetime.fromtimestamp(os.path.getctime(checkpoint_file))
                 if current_time - creation_time < self.max_hours:
