@@ -175,3 +175,102 @@ class WeightedKNNClassifier(Metric):
         self.reset()
 
         return top1, top5
+
+
+class WeightedMultiLabelKNNClassifier(Metric):
+    def __init__(
+        self,
+        k: int = 20,
+        T: float = 0.07,
+        max_distance_matrix_size: int = int(5e6),
+        distance_fx: str = "cosine",
+        epsilon: float = 0.00001,
+        dist_sync_on_step: bool = False,
+    ):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.k = k
+        self.T = T
+        self.max_distance_matrix_size = max_distance_matrix_size
+        self.distance_fx = distance_fx
+        self.epsilon = epsilon
+
+        self.add_state("train_features", default=[], persistent=False)
+        self.add_state("train_targets", default=[], persistent=False)
+        self.add_state("test_features", default=[], persistent=False)
+        self.add_state("test_targets", default=[], persistent=False)
+
+    def update(
+        self,
+        train_features: torch.Tensor = None,
+        train_targets: torch.Tensor = None,
+        test_features: torch.Tensor = None,
+        test_targets: torch.Tensor = None,
+    ):
+        assert (train_features is None) == (train_targets is None)
+        assert (test_features is None) == (test_targets is None)
+
+        if train_features is not None:
+            assert train_features.size(0) == train_targets.size(0)
+            self.train_features.append(train_features.detach())
+            self.train_targets.append(train_targets.detach())
+
+        if test_features is not None:
+            assert test_features.size(0) == test_targets.size(0)
+            self.test_features.append(test_features.detach())
+            self.test_targets.append(test_targets.detach())
+
+    @torch.no_grad()
+    def compute(self) -> Tuple[float, float]:
+        if not self.train_features or not self.test_features:
+            return -1, -1
+
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        train_features = torch.cat(self.train_features)
+        train_targets = torch.cat(self.train_targets).float()
+        test_features = torch.cat(self.test_features)
+        test_targets = torch.cat(self.test_targets).float()
+
+        if self.distance_fx == "cosine":
+            train_features = F.normalize(train_features)
+            test_features = F.normalize(test_features)
+
+        num_train_images = train_targets.size(0)
+        num_test_images = test_targets.size(0)
+        chunk_size = min(
+            max(1, self.max_distance_matrix_size // num_train_images),
+            num_test_images,
+        )
+        k = min(self.k, num_train_images)
+
+        scores = []
+        for idx in range(0, num_test_images, chunk_size):
+            features = test_features[idx : min((idx + chunk_size), num_test_images)]
+
+            if self.distance_fx == "cosine":
+                similarities = torch.mm(features, train_features.t())
+            elif self.distance_fx == "euclidean":
+                similarities = 1 / (torch.cdist(features, train_features) + self.epsilon)
+            else:
+                raise NotImplementedError
+
+            similarities, indices = similarities.topk(k, largest=True, sorted=True)
+            if self.distance_fx == "cosine":
+                weights = similarities.clone().div_(self.T).exp_()
+            else:
+                weights = similarities
+
+            neighbors = train_targets[indices]
+            denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            probs = (neighbors * weights.unsqueeze(-1)).sum(dim=1) / denom
+            scores.append(probs.cpu())
+
+        y_score = torch.cat(scores).numpy()
+        y_true = test_targets.cpu().numpy()
+        mean_auroc = roc_auc_score(y_true, y_score, average="macro")
+        mean_ap = average_precision_score(y_true, y_score, average="macro")
+
+        self.reset()
+
+        return float(mean_auroc) * 100.0, float(mean_ap) * 100.0

@@ -41,7 +41,22 @@ except ImportError:
 else:
     _h5_available = True
 
-from src.data.custom_datasets import IDRCell100K, IDRCell100K_3Channels, BBBC021, BloodMNIST, BBBC048, CyclOPS, TissueMNIST, Transloc, BBBC021xBray, MTBenchReg, Bray
+from src.data.custom_datasets import IDRCell100K, IDRCell100K_3Channels, BBBC021, BloodMNIST, BBBC048, CyclOPS, TissueMNIST, Transloc, BBBC021xBray, MTBenchReg, Bray, MedMNISTNPZ
+
+MEDMNIST_NPZ_DATASETS = {
+    "bloodmnist",
+    "chestmnist",
+    "pathmnist",
+    "dermamnist",
+    "octmnist",
+    "pneumoniamnist",
+    "breastmnist",
+    "retinamnist",
+    "organamnist",
+    "organcmnist",
+    "organsmnist",
+    "tissuemnist",
+}
 
 class AlbumentationTransform:
     def __init__(self, transform=None):
@@ -216,6 +231,23 @@ def prepare_transforms(dataset: str) -> Tuple[nn.Module, nn.Module]:
         ),
     }
 
+    medmnist_pipeline = {
+        "T_train": transforms.Compose(
+            [
+                transforms.RandomResizedCrop(size=224, scale=(0.9, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+            ]
+        ),
+        "T_val": transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+            ]
+        ),
+    }
+
     bbbc048_pipeline = {
         "T_train": transforms.Compose(
             [
@@ -294,6 +326,16 @@ def prepare_transforms(dataset: str) -> Tuple[nn.Module, nn.Module]:
         "idrcell100k_3channels": idrcell100k_pipeline, # same as idrcell100k_pipeline
         "bbbc021": bbbc021_pipeline,
         "bloodmnist": bloodmnist_pipeline,
+        "chestmnist": medmnist_pipeline,
+        "pathmnist": medmnist_pipeline,
+        "dermamnist": medmnist_pipeline,
+        "octmnist": medmnist_pipeline,
+        "pneumoniamnist": medmnist_pipeline,
+        "breastmnist": medmnist_pipeline,
+        "retinamnist": medmnist_pipeline,
+        "organamnist": medmnist_pipeline,
+        "organcmnist": medmnist_pipeline,
+        "organsmnist": medmnist_pipeline,
         "bbbc048": bbbc048_pipeline,
         "cyclops": cyclops_pipeline,
         "tissuemnist": tissuemnist_pipeline,
@@ -353,7 +395,7 @@ def prepare_datasets(
         sandbox_folder = Path(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         val_data_path = sandbox_folder / "datasets"
 
-    assert dataset in ["cifar10", "cifar100", "stl10", "imagenet", "imagenet100", "bbbc021", "idrcell100k", "idrcell100k_3channels", "bloodmnist", "bbbc048", "cyclops", "tissuemnist", "transloc", "bbbc021xbray", "mtbenchreg", "bray"]
+    assert dataset in ["cifar10", "cifar100", "stl10", "imagenet", "imagenet100", "bbbc021", "idrcell100k", "idrcell100k_3channels", "bloodmnist", "bbbc048", "cyclops", "tissuemnist", "transloc", "bbbc021xbray", "mtbenchreg", "bray", *MEDMNIST_NPZ_DATASETS]
 
     # ----------- Natural images datasets ----------- #
     if dataset in ["cifar10", "cifar100"]:
@@ -413,9 +455,21 @@ def prepare_datasets(
         train_dataset = BBBC021(root_dir=train_data_path, train=True, transform=T_train, sample_ratio=sample_ratio)
         val_dataset = BBBC021(root_dir=val_data_path, train=False, transform=T_val, sample_ratio=sample_ratio)
 
-    elif dataset == "bloodmnist":
-        train_dataset = BloodMNIST(root_dir=train_data_path, train=True, transform=T_train, sample_ratio=sample_ratio)
-        val_dataset = BloodMNIST(root_dir=val_data_path, train=False, transform=T_val, sample_ratio=sample_ratio)
+    elif dataset in MEDMNIST_NPZ_DATASETS:
+        train_dataset = MedMNISTNPZ(
+            root_dir=train_data_path,
+            train=True,
+            transform=T_train,
+            sample_ratio=sample_ratio,
+            dataset_name=dataset,
+        )
+        val_dataset = MedMNISTNPZ(
+            root_dir=val_data_path,
+            train=False,
+            transform=T_val,
+            sample_ratio=sample_ratio,
+            dataset_name=dataset,
+        )
 
     elif dataset == "bbbc048":
         train_dataset = BBBC048(root_dir=train_data_path, train=True, transform=T_train, sample_ratio=sample_ratio)
@@ -424,10 +478,6 @@ def prepare_datasets(
     elif dataset == "cyclops":
         train_dataset = CyclOPS(root_dir=train_data_path, train=True, transform=T_train, sample_ratio=sample_ratio)
         val_dataset = CyclOPS(root_dir=val_data_path, train=False, transform=T_val, sample_ratio=sample_ratio)
-
-    elif dataset == "tissuemnist":
-        train_dataset = TissueMNIST(root_dir=train_data_path, train=True, transform=T_train, sample_ratio=sample_ratio)
-        val_dataset = TissueMNIST(root_dir=val_data_path, train=False, transform=T_val, sample_ratio=sample_ratio)
 
     # ----------- Regression dataset ----------- #
     elif dataset == "transloc":

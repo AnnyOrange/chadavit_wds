@@ -38,7 +38,7 @@ from src.data.classification_dataloader import (
     prepare_transforms,
 )
 from src.methods import METHODS
-from src.utils.knn import WeightedKNNClassifier
+from src.utils.knn import WeightedKNNClassifier, WeightedMultiLabelKNNClassifier
 from src.utils.misc import omegaconf_select, seed_everything_manual
 from src.data.channels_strategies import modify_first_layer
 
@@ -119,6 +119,33 @@ def run_knn(
 
     return acc1, acc5
 
+
+@torch.no_grad()
+def run_multilabel_knn(
+    train_features: torch.Tensor,
+    train_targets: torch.Tensor,
+    test_features: torch.Tensor,
+    test_targets: torch.Tensor,
+    k: int,
+    T: float,
+    distance_fx: str,
+) -> Tuple[float]:
+    knn = WeightedMultiLabelKNNClassifier(
+        k=k,
+        T=T,
+        distance_fx=distance_fx,
+    )
+    knn(
+        train_features=train_features,
+        train_targets=train_targets,
+        test_features=test_features,
+        test_targets=test_targets,
+    )
+    mean_auroc, mean_ap = knn.compute()
+    del knn
+    return mean_auroc, mean_ap
+
+
 @torch.no_grad()
 def results_to_csv(csv_filename:str, cfg:DictConfig, train_features: torch.Tensor, train_targets: torch.Tensor, test_features: torch.Tensor, test_targets: torch.Tensor):
     # Open the CSV file for writing
@@ -127,7 +154,11 @@ def results_to_csv(csv_filename:str, cfg:DictConfig, train_features: torch.Tenso
         csv_writer = csv.writer(csv_file)
 
         # Write the header row to the CSV file
-        csv_writer.writerow(["Feature Type", "Distance Function", "k", "T", "acc@1", "acc@5"])
+        is_multilabel = train_targets.ndim == 2
+        if is_multilabel:
+            csv_writer.writerow(["Feature Type", "Distance Function", "k", "T", "mean_auroc", "mean_ap"])
+        else:
+            csv_writer.writerow(["Feature Type", "Distance Function", "k", "T", "acc@1", "acc@5"])
 
         # run k-nn for all possible combinations of parameters
         for feat_type in cfg.knn_eval_offline.feature_type:
@@ -138,16 +169,28 @@ def results_to_csv(csv_filename:str, cfg:DictConfig, train_features: torch.Tenso
                     for T in temperatures:
                         print("---")
                         print(f"Running k-NN with params: distance_fx={distance_fx}, k={k}, T={T}...")
-                        acc1, acc5 = run_knn(
-                            train_features=train_features[feat_type],
-                            train_targets=train_targets,
-                            test_features=test_features[feat_type],
-                            test_targets=test_targets,
-                            k=k,
-                            T=T,
-                            distance_fx=distance_fx,
-                        )
-                        print(f"Result: acc@1={acc1}, acc@5={acc5}")
+                        if is_multilabel:
+                            acc1, acc5 = run_multilabel_knn(
+                                train_features=train_features[feat_type],
+                                train_targets=train_targets,
+                                test_features=test_features[feat_type],
+                                test_targets=test_targets,
+                                k=k,
+                                T=T,
+                                distance_fx=distance_fx,
+                            )
+                            print(f"Result: mean_auroc={acc1}, mean_ap={acc5}")
+                        else:
+                            acc1, acc5 = run_knn(
+                                train_features=train_features[feat_type],
+                                train_targets=train_targets,
+                                test_features=test_features[feat_type],
+                                test_targets=test_targets,
+                                k=k,
+                                T=T,
+                                distance_fx=distance_fx,
+                            )
+                            print(f"Result: acc@1={acc1}, acc@5={acc5}")
 
                         # Write the results to the CSV file
                     csv_writer.writerow([feat_type, distance_fx, k, T, acc1, acc5])
@@ -183,7 +226,8 @@ def main(cfg: DictConfig):
     else:
         assert (ckpt_path.endswith(".ckpt") or ckpt_path.endswith(".pth") or ckpt_path.endswith(".pt")), "If not loading pretrained imagenet weights on backbone, weights_init must be a .ckpt or .pth file"
         # build paths
-        split_path = ckpt_path.split("/")
+        resolved_ckpt_path = os.path.realpath(ckpt_path)
+        split_path = resolved_ckpt_path.split("/")
         # Get the name of the folder containing the checkpoint
         ckpt_dir = "/".join(split_path[:-1])
         args_path = ckpt_dir + "/args.json"

@@ -295,6 +295,7 @@ def main(cfg: DictConfig):
         callbacks.append(auto_umap)
 
     # Logger
+    logger = None
     if cfg.wandb.enabled:
         if not cfg.slurm.enabled:
             logger = WandbLogger(

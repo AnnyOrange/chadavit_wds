@@ -1,14 +1,45 @@
-trained_models_full_900G
-trained_models
-lightning_logs
-__pycache__
-eval_results
-eval_data
-trained_models_full1TB_np65536_in
-trained_models_full1TB_np65536
-trained_models_full1TB
-trained_models_full1TB_np65536_weakaug
-update.bundle
-trained_models_full1TB_np65536_n1/
-wandb/
+# Python/cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local agent/editor files
 .codex
+.vscode/
+.idea/
+
+# Experiment logs
+lightning_logs/
+wandb/
+*.log
+
+# Training outputs / checkpoints
+trained_models/
+trained_models*/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# Evaluation outputs / generated summaries
+eval_results/
+eval_data/
+csv_archive/
+knn_*_knn_offline_eval.csv
+
+# Dataset archives / large binary data
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.npy
+*.npz
+
+# Hydra/runtime outputs
+outputs/
+multirun/
+.hydra/
+
+# Local transfer bundles
+update.bundle

@@ -80,7 +80,10 @@ def one_channel_collate_fn(batch):
     # Flatten crop_lists if len(crop_lists) == 1
     crop_lists = crop_lists[0] if len(crop_lists) == 1 else crop_lists
 
-    batched_labels = torch.tensor(batched_labels)
+    if isinstance(batched_labels[0], torch.Tensor):
+        batched_labels = torch.stack(batched_labels)
+    else:
+        batched_labels = torch.tensor(batched_labels)
 
     return crop_lists, batched_labels, num_channels_lists
 

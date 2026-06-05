@@ -7,12 +7,14 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from typing import List, Optional
 
 
 @dataclass
 class TaskSpec:
     name: str
+    dataset: str
     config_path: str
     config_name: str
     train_path: str
@@ -37,6 +39,7 @@ class RunResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=str, required=True)
+    parser.add_argument("--benchmark-root", type=str, default="/mnt/huawei_deepcad/benchmark")
     parser.add_argument("--ckpt-dir", type=str, required=True)
     parser.add_argument("--official-ckpt", type=str, required=True)
     parser.add_argument("--tasks", type=str, default="cyclops,bbbc048")
@@ -52,10 +55,12 @@ def parse_args() -> argparse.Namespace:
 def build_tasks(args: argparse.Namespace) -> List[TaskSpec]:
     tasks: List[TaskSpec] = []
     selected = {t.strip().lower() for t in args.tasks.split(",") if t.strip()}
+    medmnist_root = f"{args.benchmark_root}/Classification/MedMNIST"
     if "cyclops" in selected:
         tasks.append(
             TaskSpec(
                 name="cyclops",
+                dataset="cyclops",
                 config_path="scripts/knn/cyclops",
                 config_name="dino_chada_vit_moyen.yaml",
                 train_path=f"{args.repo_root}/eval_data/cyclops",
@@ -69,10 +74,39 @@ def build_tasks(args: argparse.Namespace) -> List[TaskSpec]:
         tasks.append(
             TaskSpec(
                 name="bbbc048",
+                dataset="bbbc048",
                 config_path="scripts/knn/bbbc048",
                 config_name="dino_chada_vit_moyen.yaml",
                 train_path=f"{args.repo_root}/eval_data/bbbc048",
                 val_path=f"{args.repo_root}/eval_data/bbbc048",
+                sample_ratio=args.sample_ratio,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+        )
+    medmnist_tasks = {
+        "bloodmnist",
+        "chestmnist",
+        "pathmnist",
+        "dermamnist",
+        "octmnist",
+        "pneumoniamnist",
+        "breastmnist",
+        "retinamnist",
+        "organamnist",
+        "organcmnist",
+        "organsmnist",
+        "tissuemnist",
+    }
+    for task_name in sorted(selected & medmnist_tasks):
+        tasks.append(
+            TaskSpec(
+                name=task_name,
+                dataset=task_name,
+                config_path="scripts/knn/bbbc048",
+                config_name="dino_chada_vit_moyen.yaml",
+                train_path=medmnist_root,
+                val_path=medmnist_root,
                 sample_ratio=args.sample_ratio,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
@@ -92,7 +126,9 @@ def parse_knn_csv(csv_path: Path) -> (float, float):
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
         row = next(reader)
-    return float(row["acc@1"]), float(row["acc@5"])
+    if "acc@1" in row:
+        return float(row["acc@1"]), float(row["acc@5"])
+    return float(row["mean_auroc"]), float(row["mean_ap"])
 
 
 def run_one(
@@ -106,7 +142,25 @@ def run_one(
     run_name = f"knn_{task.name}_{ckpt_id}"
     output_csv = repo_root / f"{run_name}_knn_offline_eval.csv"
     if output_csv.exists():
-        output_csv.unlink()
+        try:
+            acc1, acc5 = parse_knn_csv(output_csv)
+            return RunResult(
+                task=task.name,
+                ckpt_id=ckpt_id,
+                ckpt_path=ckpt_path,
+                output_csv=str(output_csv),
+                status="ok",
+                acc1=acc1,
+                acc5=acc5,
+                stderr_tail="cached",
+            )
+        except Exception:
+            # Corrupt/partial cached CSV (e.g. truncated by a killed run) -> drop and recompute
+            # instead of letting parse errors crash the whole sweep.
+            try:
+                output_csv.unlink()
+            except OSError:
+                pass
     backbone_max_channels = "10" if "official" in ckpt_id.lower() else "8"
 
     cmd = [
@@ -118,6 +172,7 @@ def run_one(
         task.config_name,
         f"name={run_name}",
         f"weights_init={ckpt_path}",
+        f"data.dataset={task.dataset}",
         f"data.train_path={task.train_path}",
         f"data.val_path={task.val_path}",
         f"+data.sample_ratio={task.sample_ratio}",
@@ -306,17 +361,21 @@ def main():
         raise ValueError("No GPUs provided.")
 
     results: List[RunResult] = []
-    assignments = {gpu: [] for gpu in gpus}
-    idx = 0
+    # Shared work queue -> dynamic load balancing: each GPU worker pulls the next
+    # checkpoint as soon as it is free, so all GPUs stay busy until the queue drains
+    # (avoids the end-of-task tail where statically-assigned GPUs sit idle).
+    work: "Queue" = Queue()
     for task in tasks:
         for ckpt_id, ckpt_path in ckpt_items:
-            gpu = gpus[idx % len(gpus)]
-            assignments[gpu].append((task, ckpt_id, ckpt_path))
-            idx += 1
+            work.put((task, ckpt_id, ckpt_path))
 
-    def run_gpu_queue(gpu: str) -> List[RunResult]:
+    def gpu_worker(gpu: str) -> List[RunResult]:
         gpu_results: List[RunResult] = []
-        for task, ckpt_id, ckpt_path in assignments[gpu]:
+        while True:
+            try:
+                task, ckpt_id, ckpt_path = work.get_nowait()
+            except Empty:
+                break
             r = run_one(repo_root, task, ckpt_id, ckpt_path, gpu, out_dir)
             gpu_results.append(r)
             print(
@@ -326,8 +385,8 @@ def main():
             )
         return gpu_results
 
-    with ThreadPoolExecutor(max_workers=min(args.max_workers, len(gpus))) as ex:
-        futures = [ex.submit(run_gpu_queue, gpu) for gpu in gpus]
+    with ThreadPoolExecutor(max_workers=len(gpus)) as ex:
+        futures = [ex.submit(gpu_worker, gpu) for gpu in gpus]
         for fut in as_completed(futures):
             results.extend(fut.result())
 

@@ -19,6 +19,12 @@ class KnnSpec:
 
 
 @dataclass(frozen=True)
+class KnnSummarySpec:
+    label: str
+    summary_csvs: Tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class LinearSpec:
     label: str
     summary_csv: Path
@@ -30,6 +36,22 @@ KNN_SPECS = (
     KnnSpec("trained_models_full1TB_np65536_in", Path("trained_models_full1TB_np65536_in/outputs")),
     KnnSpec("trained_models_full1TB_np65536_n1", Path("trained_models_full1TB_np65536_n1/outputs")),
     KnnSpec("trained_models_full1TB_np65536_weakaug", Path("trained_models_full1TB_np65536_weakaug/outputs")),
+)
+
+KNN_SUMMARY_SPECS = (
+    KnnSummarySpec(
+        "trained_models_webds_shuffle_weakaug",
+        (
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e0_10/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e15_30/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e35_plus/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e140_190/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e195_210/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e195_plus/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e215_plus/knn_sweep_summary.csv"),
+            Path("eval_results/knn_sweep_webds_shuffle_weakaug_e250_plus/knn_sweep_summary.csv"),
+        ),
+    ),
 )
 
 LINEAR_SPECS = (
@@ -79,6 +101,39 @@ def read_knn_rows(repo_root: Path) -> Tuple[List[Dict[str, object]], Dict[Tuple[
                     baselines[(task, "acc1")] = float(row["acc@1"])
                     baselines[(task, "acc5")] = float(row["acc@5"])
                     break
+
+    for spec in KNN_SUMMARY_SPECS:
+        for summary_csv in spec.summary_csvs:
+            path = repo_root / summary_csv
+            if not path.exists():
+                continue
+            with path.open("r", newline="") as f:
+                for row in csv.DictReader(f):
+                    if row["status"] != "ok":
+                        continue
+                    task = row["task"]
+                    if task not in TASKS:
+                        continue
+                    ckpt_id = row["ckpt_id"]
+                    if "official" in ckpt_id.lower():
+                        if row["acc1"]:
+                            baselines.setdefault((task, "acc1"), float(row["acc1"]))
+                        if row["acc5"]:
+                            baselines.setdefault((task, "acc5"), float(row["acc5"]))
+                        continue
+                    m = LINEAR_RE.match(ckpt_id)
+                    if not m:
+                        continue
+                    rows.append(
+                        {
+                            "model": spec.label,
+                            "task": task,
+                            "epoch": int(m.group("epoch")),
+                            "acc1": float(row["acc1"]),
+                            "acc5": float(row["acc5"]),
+                            "source": str(path),
+                        }
+                    )
     return rows, baselines
 
 
@@ -141,7 +196,7 @@ def plot_rows(
     import matplotlib.pyplot as plt
 
     plt.figure(figsize=(12, 6))
-    colors = ["#1b6ca8", "#d17a22", "#258a5b", "#7b3fb2", "#b3284d", "#6a6a6a"]
+    colors = ["#1b6ca8", "#d17a22", "#258a5b", "#7b3fb2", "#b3284d", "#6a6a6a", "#c49a00"]
     for spec, color in zip(specs, colors):
         series = sorted(
             [r for r in rows if r["task"] == task and r["model"] == spec.label],
@@ -149,6 +204,10 @@ def plot_rows(
         )
         if not series:
             continue
+        label = spec.label
+        if spec.label == "trained_models_webds_shuffle_weakaug":
+            best = max(series, key=lambda r: float(r[metric]))
+            label = f"{spec.label} best {best[metric]:.2f}@{best['epoch']}"
         plt.plot(
             [r["epoch"] for r in series],
             [r[metric] for r in series],
@@ -156,7 +215,7 @@ def plot_rows(
             linewidth=2.0,
             markersize=4,
             color=color,
-            label=spec.label,
+            label=label,
         )
 
     baseline = baselines.get((task, metric))
@@ -206,13 +265,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     knn_rows, knn_baselines = read_knn_rows(repo_root)
+    knn_specs = (*KNN_SPECS, *KNN_SUMMARY_SPECS)
     write_rows(knn_rows, out_dir / "knn_comparison_metrics.csv")
     for task in TASKS:
         for metric in METRICS:
             plot_rows(
                 knn_rows,
                 knn_baselines,
-                KNN_SPECS,
+                knn_specs,
                 task,
                 metric,
                 "KNN Comparison",

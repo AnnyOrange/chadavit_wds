@@ -947,6 +947,84 @@ class BloodMNIST(Dataset):
         return data_list
 
 
+class MedMNISTNPZ(Dataset):
+    """
+    Generic loader for MedMNIST .npz files.
+
+    The files are expected to contain train_images/train_labels and
+    test_images/test_labels arrays. Single-label datasets return scalar labels;
+    multi-label datasets such as ChestMNIST return a binary label vector.
+    """
+
+    img_channels = None
+    is_multiclass = True
+    task = "classification"
+    images_format = ".npz"
+
+    def __init__(
+        self,
+        root_dir=None,
+        train=True,
+        transform=None,
+        shuffle=False,
+        sample_ratio=1.0,
+        dataset_name=None,
+    ):
+        self.root_dir = root_dir
+        self.train = train
+        self.transform = transform
+        self.sample_ratio = sample_ratio
+        self.dataset_name = dataset_name
+
+        if self.dataset_name is None:
+            raise ValueError("dataset_name must be provided for MedMNISTNPZ")
+
+        self.file_list = self._collect_files()
+
+        if self.train:
+            if sample_ratio is not None and not 0 < sample_ratio <= 1:
+                raise ValueError("Sample ratio must be between 0 and 1")
+            if sample_ratio:
+                self.file_list = random.sample(
+                    self.file_list, int(len(self.file_list) * sample_ratio)
+                )
+
+        if shuffle:
+            random.shuffle(self.file_list)
+
+    def __getitem__(self, index):
+        image, label = self.file_list[index]
+        if image.ndim == 2:
+            image = Image.fromarray(image)
+        elif image.ndim == 3:
+            image = Image.fromarray(image)
+        else:
+            raise ValueError(f"Unsupported image shape: {image.shape}")
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        if np.ndim(label) == 0:
+            label = int(label)
+        else:
+            label = torch.as_tensor(label, dtype=torch.float32)
+
+        return image, label
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def _collect_files(self):
+        split = "train" if self.train else "test"
+        data_path = os.path.join(self.root_dir, f"{self.dataset_name}.npz")
+        data = np.load(data_path)
+        images = data[f"{split}_images"]
+        labels = data[f"{split}_labels"]
+        if labels.ndim == 2 and labels.shape[1] == 1:
+            labels = np.squeeze(labels)
+        return [(img, label) for img, label in zip(images, labels)]
+
+
 class BBBC021(Dataset):
     def __init__(
         self, root_dir: str, train: bool = True, transform: Optional[Callable] = None
