@@ -17,6 +17,8 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -34,6 +36,7 @@ class DINOLoss(nn.Module):
         num_epochs: int,
         student_temp: float = 0.1,
         num_large_crops: int = 2,
+        num_crops: Optional[int] = None,
         center_momentum: float = 0.9,
     ):
         """Auxiliary module to compute DINO's loss.
@@ -46,7 +49,9 @@ class DINOLoss(nn.Module):
             warmup_teacher_temp_epochs (float): number of epochs for the cosine annealing schedule.
             num_epochs (int): total number of epochs.
             student_temp (float, optional): temperature for the student. Defaults to 0.1.
-            num_large_crops (int, optional): number of crops/views. Defaults to 2.
+            num_large_crops (int, optional): number of teacher/global crops. Defaults to 2.
+            num_crops (int, optional): total number of student crops. Defaults to
+                num_large_crops for backward compatibility.
             center_momentum (float, optional): momentum for the EMA update of the center of
                 mass of the teacher. Defaults to 0.9.
         """
@@ -56,6 +61,9 @@ class DINOLoss(nn.Module):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.num_large_crops = num_large_crops
+        self.num_crops = num_crops if num_crops is not None else num_large_crops
+        if self.num_crops < self.num_large_crops:
+            raise ValueError("num_crops must be greater than or equal to num_large_crops.")
         self.register_buffer("center", torch.zeros(1, num_prototypes))
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training unstable at the beginning
@@ -79,12 +87,12 @@ class DINOLoss(nn.Module):
         """
 
         student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.num_large_crops)
+        student_out = student_out.chunk(self.num_crops)
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[self.epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        teacher_out = teacher_out.detach().chunk(self.num_large_crops)
 
         total_loss = 0
         n_loss_terms = 0

@@ -175,6 +175,8 @@ class DINO(BaseMomentumMethod):
             teacher_temp=teacher_temperature,
             warmup_teacher_temp_epochs=warmup_teacher_temperature_epochs,
             num_epochs=self.max_epochs,
+            num_large_crops=self.num_large_crops,
+            num_crops=self.num_crops,
         )
 
     @staticmethod
@@ -294,6 +296,19 @@ class DINO(BaseMomentumMethod):
 
         out = super().momentum_forward(X, index)
         z = self.momentum_head(out["feats"])
+        out.update({"z": z})
+        return out
+
+    def multicrop_forward(self, X: torch.Tensor, index: int) -> Dict[str, Any]:
+        """Performs the student forward pass for local crops.
+
+        BaseMethod only returns backbone features for multicrop views. DINO needs
+        every student crop to pass through the DINO head so local crops contribute
+        to the DINO loss.
+        """
+
+        out = super().multicrop_forward(X, index)
+        z = self.head(out["feats"])
         out.update({"z": z})
         return out
 
